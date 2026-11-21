@@ -1,0 +1,33 @@
+services:
+  ansible:
+    build:
+      # This directory: the image copies nothing in, so there is no repo root to
+      # send to the daemon and no .dockerignore to keep.
+      context: .
+      args:
+        UID: "1001"
+        GID: "1001"
+    image: homelab-ansible:local
+    container_name: ansible
+    hostname: ansible
+    # Reap zombies and forward signals, so `compose down` stops it promptly.
+    init: true
+    restart: unless-stopped
+    # Ansible drives everything over SSH and needs no Linux capabilities.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      # Playbooks (this repo).
+      - ../../ansible:/home/ansible/ansible:ro
+      # Inventory and config files (private homelab-base-configs repo, cloned
+      # alongside). Its directory name is hardcoded here, so renaming that repo
+      # means editing this line too. A missing source is not an error: Docker
+      # creates an empty directory and playbooks fail later on a missing inventory.
+      - ../../../homelab-base-configs/ansible:/home/ansible/config:ro
+      # Only the two files the container needs, rather than all of ~/.ssh, so a
+      # future key placed there is not exposed. Both must exist on the VM first or
+      # Docker creates directories in their place; create-ansible-user.sh does that.
+      - ~/.ssh/id_ed25519:/home/ansible/.ssh/id_ed25519:ro
+      - ~/.ssh/known_hosts:/home/ansible/.ssh/known_hosts:ro

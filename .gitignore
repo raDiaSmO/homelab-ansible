@@ -1,0 +1,35 @@
+# Nothing sensitive belongs in this repo; these make that mechanical.
+
+# Environment / secret files
+.env
+.env.*
+*.env
+
+# Keys, certificates, credentials
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.kdbx
+id_rsa*
+id_ecdsa*
+id_ed25519*
+known_hosts
+authorized_keys
+
+# Ansible vault and inventory (inventory lives in homelab-base-configs)
+vault*
+*vault.yml
+hosts
+inventory
+*.retry
+
+# The private config repo, if it ever gets cloned inside this one by mistake
+*base-configs/
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store

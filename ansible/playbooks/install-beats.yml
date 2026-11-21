@@ -1,0 +1,100 @@
+---
+- name: Installing linux beats agents
+  hosts: beats
+  become: true
+  vars:
+    # Where compose mounts the homelab-base-configs repo inside the container.
+    config_dir: /home/ansible/config
+
+    # Must match the stack: Elastic does not support agents newer than the cluster
+    # they report to. Single source of truth -- the packages are pinned here and
+    # then held there.
+    beats_version: '8.18.0'
+
+    # Armored, so it is read directly as a .asc keyring.
+    elastic_keyring: /etc/apt/keyrings/elastic.asc
+
+    beats:
+      - filebeat
+      - metricbeat
+      - packetbeat
+      - auditbeat
+
+  tasks:
+    - name: Downloading the Elastic APT signing key
+      ansible.builtin.get_url:
+        url: https://artifacts.elastic.co/GPG-KEY-elasticsearch
+        dest: '{{ elastic_keyring }}'
+        owner: root
+        group: root
+        mode: '0644'
+
+    # The repo rather than a direct .deb URL: `apt deb=<url>` hands the file to
+    # dpkg, which does not verify package signatures. Going through apt gets the
+    # repository signature checked, and makes a version change an upgrade rather
+    # than a reinstall. `name` is deliberately version-free: a move to 9.x edits
+    # `uris` in place instead of stranding an elastic-8x.sources file behind.
+    - name: Adding the Elastic APT repository
+      ansible.builtin.deb822_repository:
+        name: elastic
+        types: deb
+        uris: 'https://artifacts.elastic.co/packages/8.x/apt'
+        suites: stable
+        components: main
+        signed_by: '{{ elastic_keyring }}'
+        architectures: amd64
+        state: present
+
+    # Unhold first, or a pin from a previous run silently wins and bumping
+    # beats_version does nothing. Harmless on a first run.
+    - name: Releasing the previous version hold
+      ansible.builtin.dpkg_selections:
+        name: '{{ item }}'
+        selection: install
+      loop: '{{ beats }}'
+
+    # -> filebeat=8.18.0, ... allow_downgrade because an agent ahead of the stack
+    # is the unsupported case, so lowering beats_version has to work.
+    - name: Installing beats packages
+      ansible.builtin.apt:
+        pkg: "{{ beats | map('regex_replace', '$', '=' ~ beats_version) | list }}"
+        state: present
+        update_cache: true
+        allow_downgrade: true
+
+    # Without a hold, the full `apt upgrade` in ubuntu-baseline.yml would walk these
+    # agents up to the newest 8.x in the repo and past the stack version.
+    - name: Holding beats at the pinned version
+      ansible.builtin.dpkg_selections:
+        name: '{{ item }}'
+        selection: hold
+      loop: '{{ beats }}'
+
+    # 0600 because these carry the Elasticsearch credentials. Without the notify the
+    # service is already running, `state: started` is a no-op, and the beat keeps
+    # serving the previous config.
+    - name: Copying beats config files
+      ansible.builtin.copy:
+        src: '{{ config_dir }}/{{ item }}.yml'
+        dest: '/etc/{{ item }}/{{ item }}.yml'
+        owner: root
+        group: root
+        mode: '0600'
+      loop: '{{ beats }}'
+      notify: Restarting beats services
+
+    - name: Starting and enabling beats services
+      ansible.builtin.service:
+        name: '{{ item }}'
+        enabled: true
+        state: started
+      loop: '{{ beats }}'
+
+  handlers:
+    # All four rather than only the one whose config changed: on a handful of hosts
+    # that is cheaper than a dynamic notify name, which Ansible resolves unreliably.
+    - name: Restarting beats services
+      ansible.builtin.service:
+        name: '{{ item }}'
+        state: restarted
+      loop: '{{ beats }}'

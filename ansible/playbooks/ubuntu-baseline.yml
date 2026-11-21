@@ -1,0 +1,281 @@
+---
+- name: Applying the baseline configuration
+  hosts: baseline
+
+  vars:
+    # /etc/apt/keyrings, not /usr/share/keyrings, which is for distro-shipped keys.
+    # All four vendors serve ASCII-armored keys, which apt reads directly from a
+    # `.asc` keyring, so they are fetched as-is with no dearmor step. The sublime
+    # URL ends in .gpg but is armored too; the extension here reflects the format.
+    apt_keyrings:
+      - { url: 'https://download.sublimetext.com/sublimehq-pub.gpg', dest: '/etc/apt/keyrings/sublime-text.asc' }
+      - { url: 'https://download.spotify.com/debian/pubkey_5384CE82BA52C83A.asc', dest: '/etc/apt/keyrings/spotify.asc' }
+      - { url: 'https://packages.microsoft.com/keys/microsoft.asc', dest: '/etc/apt/keyrings/code.asc' }
+      - { url: 'https://www.virtualbox.org/download/oracle_vbox_2016.asc', dest: '/etc/apt/keyrings/oracle-virtualbox.asc' }
+
+    # Oracle publishes one directory per codename and can lag a new Ubuntu release
+    # by months; override with `-e virtualbox_codename=noble` when it has not
+    # caught up. The only repo below that needs a codename.
+    virtualbox_codename: '{{ ansible_facts["distribution_release"] }}'
+
+    # deb822 fields rather than one-line strings: apt_repository is deprecated and
+    # is removed in ansible-core 2.25. `name` becomes the filename written under
+    # /etc/apt/sources.list.d, so it is each repo's stable identity here -- renaming
+    # one strands its old .sources file rather than replacing it.
+    apt_repositories:
+      # Flat repository: the trailing slash on the suite is what marks it as one,
+      # and a flat repo must not carry components.
+      - name: sublime-text
+        uris: 'https://download.sublimetext.com/'
+        suites: 'apt/stable/'
+        signed_by: /etc/apt/keyrings/sublime-text.asc
+      - name: spotify
+        uris: 'https://repository.spotify.com'
+        suites: stable
+        components: non-free
+        signed_by: /etc/apt/keyrings/spotify.asc
+      - name: code
+        uris: 'https://packages.microsoft.com/repos/code'
+        suites: stable
+        components: main
+        signed_by: /etc/apt/keyrings/code.asc
+      - name: oracle-virtualbox
+        uris: 'https://download.virtualbox.org/virtualbox/debian'
+        suites: '{{ virtualbox_codename }}'
+        components: contrib
+        signed_by: /etc/apt/keyrings/oracle-virtualbox.asc
+
+    packages_to_install:
+      - git
+      - gparted
+      - vim
+      - code
+      - virtualbox-7.1
+      - libreoffice-writer
+      - usb-creator-gtk
+      - openssh-server
+      - net-tools
+      - sublime-text
+      - libimage-exiftool-perl
+      - libfuse2
+      - spotify-client
+
+    # An AppImage carries no repository signature, so the checksum is what pins the
+    # artifact and makes a version bump deterministic: get_url compares the digest
+    # every run, so editing the URL and the hash together re-downloads instead of
+    # leaving the old binary in place. Recompute with `sha256sum` when bumping.
+    # Bitwarden's URL always resolves to the current release, so it has no stable
+    # digest to pin -- hence checksum being per-item and optional. An unpinned item
+    # has to carry `force` instead: with neither, get_url skips the download
+    # whenever dest already exists, so the first run would install a version that
+    # then never updates again -- worst of all for the password manager.
+    app_images:
+      - url: 'https://github.com/obsidianmd/obsidian-releases/releases/download/v1.12.4/Obsidian-1.12.4.AppImage'
+        dest: /usr/local/bin/obsidian
+        checksum: 'sha256:0e9d2e5a56f32d92ee4f809574f94ea4f789c9c0fd742d4c19a4fe744e232718'
+      - url: 'https://vault.bitwarden.com/download/?app=desktop&platform=linux&variant=appimage'
+        dest: /usr/local/bin/bitwarden
+
+    unwanted_packages:
+      - google-chrome-stable
+      - gedit
+      - nano
+      - gnome-text-editor
+      - libreoffice-math
+      - ubuntu-report
+      - apport
+      - whoopsie
+
+    # `set -e` so a setting that fails -- an extension missing on this host, say --
+    # stops the task instead of being masked by the lines after it.
+    gsettings_commands: |
+      set -e
+
+      # Appearance and input
+      gsettings set org.gnome.shell.extensions.ding show-home false
+      gsettings set org.gnome.shell.extensions.ding show-trash false
+      gsettings set org.gnome.shell.extensions.dash-to-dock show-mounts false
+      gsettings set org.gnome.shell.extensions.dash-to-dock show-trash false
+      gsettings set org.gnome.desktop.interface color-scheme prefer-dark
+      gsettings set org.gnome.settings-daemon.plugins.color night-light-enabled true
+      gsettings set org.gnome.settings-daemon.plugins.color night-light-schedule-from 6
+      gsettings set org.gnome.settings-daemon.plugins.color night-light-schedule-to 3
+      gsettings set org.gnome.settings-daemon.plugins.color night-light-temperature 4000
+      gsettings set org.gnome.desktop.input-sources sources "[('xkb', 'us'), ('xkb', 'ca')]"
+
+      # Session locking and privacy. lock-enabled first: it is the switch the other
+      # two feed, and with it off idle-delay and lock-delay are set but inert.
+      gsettings set org.gnome.desktop.screensaver lock-enabled true
+      gsettings set org.gnome.desktop.screensaver lock-delay 0
+      gsettings set org.gnome.desktop.session idle-delay 300
+      gsettings set org.gnome.system.location enabled false
+      gsettings set org.gnome.desktop.privacy remember-recent-files false
+      gsettings set org.gnome.desktop.privacy remember-app-usage false
+      gsettings set org.gnome.desktop.privacy report-technical-problems false
+      gsettings set org.gnome.desktop.privacy send-software-usage-stats false
+
+  tasks:
+    # get_url rather than a wget|gpg --dearmor pipeline: neither tool is guaranteed
+    # on a minimal Ubuntu install, and a rotated vendor key is picked up on the next
+    # run instead of being pinned forever by a `creates:` guard.
+    - name: Downloading APT GPG keys
+      become: true
+      ansible.builtin.get_url:
+        url: '{{ item.url }}'
+        dest: '{{ item.dest }}'
+        owner: root
+        group: root
+        mode: '0644'
+      loop: "{{ apt_keyrings }}"
+
+    # No update_cache here: deb822_repository has no such option, and the task below
+    # refreshes the cache once for all four repos anyway.
+    - name: Adding APT repositories
+      become: true
+      ansible.builtin.deb822_repository:
+        name: '{{ item.name }}'
+        types: deb
+        uris: '{{ item.uris }}'
+        suites: '{{ item.suites }}'
+        components: '{{ item.components | default(omit) }}'
+        signed_by: '{{ item.signed_by }}'
+        architectures: amd64
+        state: present
+      loop: '{{ apt_repositories }}'
+      loop_control:
+        label: '{{ item.name }}'
+
+    # Quoted: `upgrade` takes a string, and bare yes is a YAML boolean.
+    - name: Updating and upgrading APT packages
+      become: true
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: 'yes'
+
+    - name: Installing specific APT packages
+      become: true
+      ansible.builtin.apt:
+        pkg: '{{ packages_to_install }}'
+        state: present
+
+    - name: Installing specific AppImages
+      become: true
+      ansible.builtin.get_url:
+        url: '{{ item.url }}'
+        dest: '{{ item.dest }}'
+        checksum: '{{ item.checksum | default(omit) }}'
+        # Derived from checksum rather than set per item, so the two cannot drift
+        # apart: a pinned artifact is compared by digest, an unpinned one is
+        # re-fetched. force sends a conditional request when the host honours one,
+        # so the cost is a round trip rather than the file, except where it does not.
+        force: '{{ item.checksum is not defined }}'
+        owner: root
+        group: root
+        mode: '0755'
+      loop: '{{ app_images }}'
+
+    - name: Removing specific APT packages
+      become: true
+      ansible.builtin.apt:
+        pkg: '{{ unwanted_packages }}'
+        state: absent
+        purge: true
+
+    # After the purge: the dependencies it orphans would otherwise survive until the
+    # next run, since nothing collects them afterwards.
+    - name: Removing orphaned APT dependencies and cached packages
+      become: true
+      ansible.builtin.apt:
+        autoremove: true
+        autoclean: true
+
+    - name: Checking for the connecting user's D-Bus session bus
+      ansible.builtin.stat:
+        path: '/run/user/{{ ansible_facts["user_uid"] }}/bus'
+      register: session_bus
+      tags: desktop
+
+    - name: Asserting the connecting user has a graphical session
+      ansible.builtin.assert:
+        that: session_bus.stat.exists
+        fail_msg: >-
+          No session bus at /run/user/{{ ansible_facts["user_uid"] }}/bus for user
+          {{ ansible_facts["user_id"] }}. The gsettings tasks apply to the account this
+          playbook logs in as, so that account must be logged into GNOME on this
+          host. Either log it in, or skip these tasks with --skip-tags desktop.
+        success_msg: 'Session bus present for {{ ansible_facts["user_id"] }}.'
+      tags: desktop
+
+    # changed_when: false because `gsettings set` reports nothing about whether the
+    # value moved, so the honest default marked every run changed. The real fix is
+    # community.general.dconf, which needs the collection back in the image and
+    # each value's GVariant type checked on a live GNOME host.
+    - name: Applying GNOME settings
+      environment:
+        DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/{{ ansible_facts["user_uid"] }}/bus'
+      ansible.builtin.shell: '{{ gsettings_commands }}'
+      changed_when: false
+      tags: desktop
+
+    # Overrides the same-named file Ubuntu ships in /usr/lib/NetworkManager.
+    - name: Disabling connectivity checking
+      become: true
+      ansible.builtin.copy:
+        dest: /etc/NetworkManager/conf.d/20-connectivity-ubuntu.conf
+        content: |
+          [connectivity]
+          enabled=false
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reloading network manager service
+
+    - name: Ensuring the journald drop-in directory exists
+      become: true
+      ansible.builtin.file:
+        path: /etc/systemd/journald.conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    # A drop-in rather than an edit of journald.conf, where the shipped setting is
+    # commented out and so was only ever appended at EOF. The restart is what makes
+    # it take effect before the next reboot.
+    - name: Limiting journal log file size
+      become: true
+      ansible.builtin.copy:
+        dest: /etc/systemd/journald.conf.d/00-size.conf
+        content: |
+          [Journal]
+          SystemMaxUse=500M
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Restarting journald service
+
+    # Hosts without a bluetooth adapter have no such unit, and a missing radio
+    # should not fail the baseline.
+    - name: Disabling bluetooth
+      become: true
+      ansible.builtin.service:
+        name: bluetooth
+        state: stopped
+        enabled: false
+      register: bluetooth_disable
+      failed_when: >-
+        bluetooth_disable is failed
+        and 'could not find' not in (bluetooth_disable.msg | default('') | lower)
+
+  handlers:
+    - name: Reloading network manager service
+      become: true
+      ansible.builtin.service:
+        name: NetworkManager
+        state: reloaded
+
+    - name: Restarting journald service
+      become: true
+      ansible.builtin.service:
+        name: systemd-journald
+        state: restarted
